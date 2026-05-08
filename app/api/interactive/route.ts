@@ -1,0 +1,89 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { supabaseAdmin } from '@/lib/supabase'
+import { SESSIONS, TEACHERS, INTERACTIVE_DEADLINE_MS } from '@/lib/interactive'
+import { fetchInteractiveConfig } from '@/lib/interactive-config'
+
+// id + code 可來自 query string 或 body（呼叫方傳入已解析的值）
+async function authMember(id: string | null, code: string | null) {
+  if (!id || !code) return { error: '缺少必要參數', status: 400 }
+
+  const { data: reg, error } = await supabaseAdmin
+    .from('registrations')
+    .select('id, status, chinese_name, member_id, student_id, gender, identity, email')
+    .eq('id', id)
+    .eq('random_code', code.toUpperCase().trim())
+    .single()
+  if (error || !reg) return { error: '無效的存取連結', status: 401 }
+  if (reg.status !== 'approved') return { error: '本頁僅限錄取學員', status: 403 }
+  return { reg }
+}
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url)
+  const a = await authMember(searchParams.get('id'), searchParams.get('code'))
+  if ('error' in a) return NextResponse.json({ error: a.error }, { status: a.status })
+
+  const { data: row } = await supabaseAdmin
+    .from('interactive_registrations')
+    .select('*')
+    .eq('registration_id', a.reg.id)
+    .maybeSingle()
+
+  const config = await fetchInteractiveConfig()
+  const isAdmin = request.cookies.get('admin_role')?.value === 'admin'
+  return NextResponse.json({
+    registration: a.reg,
+    interactive: row,
+    deadline: INTERACTIVE_DEADLINE_MS,
+    open: config.open || isAdmin,
+    preview: isAdmin && !config.open,
+  })
+}
+
+export async function POST(request: NextRequest) {
+  // body 只讀一次
+  const body = await request.json().catch(() => ({}))
+
+  const a = await authMember(body.id ?? null, body.code ?? null)
+  if ('error' in a) return NextResponse.json({ error: a.error }, { status: a.status })
+
+  const config = await fetchInteractiveConfig()
+  const isAdmin = request.cookies.get('admin_role')?.value === 'admin'
+  if (!config.open && !isAdmin) {
+    return NextResponse.json({ error: '互動報名尚未開放' }, { status: 400 })
+  }
+  if (Date.now() > INTERACTIVE_DEADLINE_MS) {
+    return NextResponse.json({ error: '互動報名已截止' }, { status: 400 })
+  }
+
+  const wanted_sessions: string[] = Array.isArray(body.wanted_sessions) ? body.wanted_sessions : []
+  const wanted_ranking: string[] = Array.isArray(body.wanted_ranking) ? body.wanted_ranking : []
+
+  const validSessions = new Set(SESSIONS.map(s => s.id))
+  if (!wanted_sessions.every(s => validSessions.has(s as any))) {
+    return NextResponse.json({ error: '集體場次選擇不合法' }, { status: 400 })
+  }
+  const validTeachers = new Set(TEACHERS.map(t => t.id))
+  if (wanted_ranking.length > 4) {
+    return NextResponse.json({ error: '分組互動最多選 4 個' }, { status: 400 })
+  }
+  if (!wanted_ranking.every(t => validTeachers.has(t as any))) {
+    return NextResponse.json({ error: '分組老師選擇不合法' }, { status: 400 })
+  }
+
+  const { error } = await supabaseAdmin
+    .from('interactive_registrations')
+    .upsert(
+      {
+        registration_id: a.reg.id,
+        wanted_sessions,
+        wanted_ranking,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'registration_id' }
+    )
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+  return NextResponse.json({ success: true })
+}
